@@ -55,27 +55,37 @@ void Meter::handle_frame(wmbus_radio::Frame *frame) {
   auto about =
       AboutTelegram(App.get_friendly_name(), frame->rssi(), FrameType::WMBUS);
 
-  std::vector<Address> adresses;
-  bool id_match = false;
-  // Pokúsime sa dekódovať telegram na rôznych offsetoch v prípade, že
-  // rádio vrátilo fragmenty alebo stream s posunom (fix pre zmeny v main vetve).
+  // Získame dáta z rádia
   auto data = frame->data();
-  // Minimálna veľkosť telegramu, ktorú parser zvyčajne očakáva (približné)
+  const size_t total_size = data.size();
+
+  // Minimálna veľkosť telegramu, po ktorej má zmysel parser skúšať dekódovať.
+  // Driver_apator očakáva viac než 8 bajtov (logy ukazujú ~12), takže zvolíme 12.
   const size_t min_expected = 12;
 
-  for (size_t offset = 0; offset < data.size(); ++offset) {
-    // zostavíme podriadok od offsetu do konca
+  if (total_size < min_expected) {
+    ESP_LOGV(TAG, "Received frame too short (%u bytes) - skipping", (unsigned)total_size);
+    return;
+  }
+
+  // Obmedzíme počet offsetov, ktoré skúšame (ochrana proti extrémne dlhým dátam).
+  // Nemusíme skúšať offsety, kde zostávajúce bajty < min_expected.
+  size_t max_offset = total_size > min_expected ? total_size - min_expected : 0;
+
+  for (size_t offset = 0; offset <= max_offset; ++offset) {
+    // slice od offsetu do konca
     std::vector<unsigned char> slice(data.begin() + offset, data.end());
 
+    // Vytvoríme telegram object pre parser
     auto telegram = std::make_unique<Telegram>();
-    // Pokúsime sa spracovať slice ako telegram
     bool local_id_match = false;
     std::vector<Address> local_addresses;
-    // call handleTelegram on this slice
+
+    // Pokúsime sa spracovať slice ako telegram
     this->meter->handleTelegram(about, slice, false, &local_addresses, &local_id_match, telegram.get());
 
     if (local_id_match) {
-      // úspešne identifikovaný meter v tejto časti: použijeme výsledok
+      // Úspech: meter identifikovaný v tomto slice - použijeme výsledok
       this->last_telegram = std::move(telegram);
       this->defer([this]() {
         this->on_telegram_callback_manager();
@@ -87,8 +97,7 @@ void Meter::handle_frame(wmbus_radio::Frame *frame) {
       return;
     }
 
-    // rýchle optimalizačné pravidlo: ak slice je kratší než min_expected,
-    // a parser nepotvrdil id, ďalej skúšať nemá zmysel (môžeme ukončiť).
+    // Ak zostávajúci slice je kratší než min_expected, už nemá zmysel skúšať ďalšie offsety
     if (slice.size() < min_expected) {
       break;
     }
