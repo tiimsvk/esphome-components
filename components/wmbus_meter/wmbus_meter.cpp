@@ -57,20 +57,46 @@ void Meter::handle_frame(wmbus_radio::Frame *frame) {
 
   std::vector<Address> adresses;
   bool id_match = false;
-  auto telegram = std::make_unique<Telegram>();
+  // Pokúsime sa dekódovať telegram na rôznych offsetoch v prípade, že
+  // rádio vrátilo fragmenty alebo stream s posunom (fix pre zmeny v main vetve).
+  auto data = frame->data();
+  // Minimálna veľkosť telegramu, ktorú parser zvyčajne očakáva (približné)
+  const size_t min_expected = 12;
 
-  this->meter->handleTelegram(about, frame->data(), false, &adresses, &id_match,
-                              telegram.get());
+  for (size_t offset = 0; offset < data.size(); ++offset) {
+    // zostavíme podriadok od offsetu do konca
+    std::vector<unsigned char> slice(data.begin() + offset, data.end());
 
-  if (id_match) {
-    this->last_telegram = std::move(telegram);
-    this->defer([this]() {
-      this->on_telegram_callback_manager();
-      this->last_telegram = nullptr;
-    });
+    auto telegram = std::make_unique<Telegram>();
+    // Pokúsime sa spracovať slice ako telegram
+    bool local_id_match = false;
+    std::vector<Address> local_addresses;
+    // call handleTelegram on this slice
+    this->meter->handleTelegram(about, slice, false, &local_addresses, &local_id_match, telegram.get());
 
-    frame->mark_as_handled();
+    if (local_id_match) {
+      // úspešne identifikovaný meter v tejto časti: použijeme výsledok
+      this->last_telegram = std::move(telegram);
+      this->defer([this]() {
+        this->on_telegram_callback_manager();
+        this->last_telegram = nullptr;
+      });
+
+      frame->mark_as_handled();
+      ESP_LOGD(TAG, "Frame handled: found meter at offset %u (slice len %u)", (unsigned)offset, (unsigned)slice.size());
+      return;
+    }
+
+    // rýchle optimalizačné pravidlo: ak slice je kratší než min_expected,
+    // a parser nepotvrdil id, ďalej skúšať nemá zmysel (môžeme ukončiť).
+    if (slice.size() < min_expected) {
+      break;
+    }
   }
+
+  // Ak sme nenašli zhodu, necháme pôvodné správanie: možno parser urobil
+  // vlastné logovanie/chybové správy (ignorujeme frame).
+  ESP_LOGV(TAG, "No id match found in frame of size %u, ignoring.", (unsigned)data.size());
 }
 
 std::string Meter::as_json(bool pretty_print) {
